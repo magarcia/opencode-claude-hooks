@@ -10,6 +10,9 @@ import { handlePreToolUse, handlePostToolUse, handlePostToolUseFailure } from ".
 import { handlePermissionRequest } from "./handlers/permission";
 import { handlePreCompact } from "./handlers/compact";
 import { handleSubagentStart, handleSubagentStop } from "./handlers/subagent";
+import { handleStop } from "./handlers/stop";
+import { handleNotification } from "./handlers/notification";
+import { handleUserPromptSubmit } from "./handlers/prompt";
 
 const sessionContexts = new Map<string, PluginContext>();
 
@@ -28,20 +31,33 @@ export const ClaudeCodeHooksPlugin: Plugin = async (input: PluginInput): Promise
   return {
     event: async ({ event }) => {
       try {
+        const props = event.properties as Record<string, any> | undefined;
+        const sessionId: string = props?.id ?? props?.sessionID ?? "unknown";
+
         if (event.type === "session.created") {
-          const props = event.properties as { id?: string } | undefined;
-          const sessionId = props?.id ?? "unknown";
           const ctx = getOrCreateContext(sessionId, projectDir);
           await handleSessionStart(ctx, false);
         }
         if (event.type === "session.deleted") {
-          const props = event.properties as { id?: string } | undefined;
-          const sessionId = props?.id ?? "unknown";
           const ctx = sessionContexts.get(sessionId);
           if (ctx) {
             await handleSessionEnd(ctx);
             sessionContexts.delete(sessionId);
           }
+        }
+        // Wire up Stop hook via session.idle / session.status idle
+        if (event.type === "session.idle" || (event.type === "session.status" && props?.status?.type === "idle")) {
+          const ctx = sessionContexts.get(sessionId);
+          if (ctx) {
+            await handleStop(ctx, "session_idle");
+          }
+        }
+        // Wire up Notification hook via tui.toast.show
+        if (event.type === "tui.toast.show") {
+          const ctx = getOrCreateContext(sessionId, projectDir);
+          const message = props?.message ?? "";
+          const level = props?.level ?? "info";
+          await handleNotification(ctx, message, level);
         }
       } catch (err) {
         // ignore
@@ -80,9 +96,11 @@ export const ClaudeCodeHooksPlugin: Plugin = async (input: PluginInput): Promise
 
     "tool.execute.after": async (hookInput, output) => {
       try {
-        const { tool: toolName, sessionID } = hookInput;
+        const { tool: toolName, sessionID, args: toolArgs } = hookInput;
         const ctx = sessionContexts.get(sessionID);
         if (!ctx) return;
+
+        const toolInput = (toolArgs as Record<string, unknown>) ?? {};
 
         // Handle subagent (Task tool)
         if (toolName === "Task") {
@@ -92,9 +110,27 @@ export const ClaudeCodeHooksPlugin: Plugin = async (input: PluginInput): Promise
         const isError = output.title?.toLowerCase().includes("error") ||
                         output.output?.toLowerCase().startsWith("error");
         if (isError) {
-          await handlePostToolUseFailure(ctx, toolName, {}, output.output);
+          await handlePostToolUseFailure(ctx, toolName, toolInput, output.output);
         } else {
-          await handlePostToolUse(ctx, toolName, {}, output.output);
+          await handlePostToolUse(ctx, toolName, toolInput, output.output);
+        }
+      } catch (err) {
+        // ignore
+      }
+    },
+
+    "chat.message": async (hookInput, _output) => {
+      try {
+        const { sessionID } = hookInput;
+        const ctx = getOrCreateContext(sessionID, projectDir);
+        const parts = _output.parts ?? [];
+        // Extract text from user message parts for UserPromptSubmit
+        const textParts = parts
+          .filter((p: any) => p.type === "text")
+          .map((p: any) => p.text ?? "")
+          .join("\n");
+        if (textParts) {
+          await handleUserPromptSubmit(ctx, textParts);
         }
       } catch (err) {
         // ignore
