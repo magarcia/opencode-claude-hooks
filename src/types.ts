@@ -20,6 +20,9 @@ export const CommandHookSchema = z.object({
   type: z.literal("command"),
   command: z.string(),
   timeout: z.number().optional(),
+  // When true (default), the command is spawned and not awaited (fire-and-forget).
+  // Set to false to wait for the command to exit and capture its output.
+  background: z.boolean().optional().default(true),
 });
 
 export const PromptHookSchema = z.object({

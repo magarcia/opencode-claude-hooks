@@ -24,6 +24,31 @@ async function executeCommandHook(
   const timeout = hook.timeout ?? DEFAULT_TIMEOUT_MS;
 
   try {
+    // Background mode is the default: spawn and return immediately without waiting for exit.
+    // Set background: false to wait for the command to finish.
+    if (hook.background !== false) {
+      const proc = Bun.spawn(["sh", "-c", hook.command], {
+        cwd: projectDir,
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+        env: {
+          ...process.env,
+          CLAUDE_PROJECT_DIR: projectDir,
+          OPENCODE_COMPAT: "true",
+        },
+      });
+      // Intentionally do not await proc.exited — fire-and-forget.
+      void proc;
+      return {
+        success: true,
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        blocked: false,
+      };
+    }
+
     const proc = Bun.spawn(["sh", "-c", hook.command], {
       cwd: projectDir,
       stdin: "pipe",

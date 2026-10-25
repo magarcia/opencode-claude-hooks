@@ -115,6 +115,18 @@ Execute shell commands with stdin/stdout:
 }
 ```
 
+**Background mode** — Run the command without waiting for it to finish (fire-and-forget). This is the default for command hooks; useful for long-running bash commands that should not block tool execution:
+
+```json
+{
+  "type": "command",
+  "command": "bash ./long-running.sh",
+  "background": true
+}
+```
+
+Set `"background": false` to wait for the command to exit and capture its output (blocking).
+
 **Input via stdin:**
 ```json
 {

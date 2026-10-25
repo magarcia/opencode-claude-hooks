@@ -52,18 +52,18 @@
     "category": "automation"
   },
   "dependencies": {
-    "zod": "^3.23.0"
+    "zod": "^3.23.0",
+    "@opencode/plugin": "^2.1.2"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.1.39",
     "@types/bun": "latest",
     "typescript": "^5.0.0"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": "*"
+    "@opencode/plugin": "*"
   },
   "peerDependenciesMeta": {
-    "@opencode-ai/plugin": {
+    "@opencode/plugin": {
       "optional": true
     }
   }

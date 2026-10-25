@@ -1,15 +1,17 @@
 /**
  * OpenCode Plugin: Claude Code Hooks Compatibility
- * Full implementation - no re-exports
+ * V2 implementation
  */
 
-import type { Plugin, PluginInput, Hooks } from "@opencode-ai/plugin";
+import { Plugin } from "@opencode/plugin";
 import type { PluginContext } from "./types";
 import { handleSessionStart, handleSessionEnd } from "./handlers/session";
 import { handlePreToolUse, handlePostToolUse, handlePostToolUseFailure } from "./handlers/tool";
 import { handlePermissionRequest } from "./handlers/permission";
 import { handlePreCompact } from "./handlers/compact";
 import { handleSubagentStart, handleSubagentStop } from "./handlers/subagent";
+
+class HookBlockedError extends Error {}
 
 const sessionContexts = new Map<string, PluginContext>();
 
@@ -22,119 +24,159 @@ function getOrCreateContext(sessionId: string, cwd: string): PluginContext {
   return ctx;
 }
 
-export const ClaudeCodeHooksPlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
-  const projectDir = input.directory || input.worktree || process.cwd();
-
-  return {
-    event: async ({ event }) => {
-      try {
-        if (event.type === "session.created") {
-          const props = event.properties as { id?: string } | undefined;
-          const sessionId = props?.id ?? "unknown";
-          const ctx = getOrCreateContext(sessionId, projectDir);
-          await handleSessionStart(ctx, false);
+function extractToolOutput(result: unknown): string {
+  if (!result || typeof result !== "object") return String(result ?? "");
+  const r = result as { content?: unknown; output?: unknown };
+  if (typeof r.content === "string") return r.content;
+  if (Array.isArray(r.content)) {
+    return r.content
+      .map((part) => {
+        if (part && typeof part === "object" && "type" in part && (part as { type: string }).type === "text") {
+          return String((part as { text?: unknown }).text ?? "");
         }
-        if (event.type === "session.deleted") {
-          const props = event.properties as { id?: string } | undefined;
-          const sessionId = props?.id ?? "unknown";
-          const ctx = sessionContexts.get(sessionId);
-          if (ctx) {
-            await handleSessionEnd(ctx);
-            sessionContexts.delete(sessionId);
+        return JSON.stringify(part);
+      })
+      .join("\n");
+  }
+  if (typeof r.output === "string") return r.output;
+  if (r.output !== undefined) return String(r.output);
+  return JSON.stringify(result);
+}
+
+export default Plugin.define({
+  id: "opencode-claude-hooks",
+  async setup(ctx) {
+    const projectDir = ctx.location?.directory || process.cwd();
+
+    // Session lifecycle via event stream
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          if (event.type === "session.created") {
+            const sessionId = (event as { data?: { sessionID?: string } }).data?.sessionID ?? "unknown";
+            const pluginCtx = getOrCreateContext(sessionId, projectDir);
+            await handleSessionStart(pluginCtx, false);
+          } else if (event.type === "session.deleted") {
+            const sessionId = (event as { data?: { sessionID?: string } }).data?.sessionID ?? "unknown";
+            const pluginCtx = sessionContexts.get(sessionId);
+            if (pluginCtx) {
+              await handleSessionEnd(pluginCtx);
+              sessionContexts.delete(sessionId);
+            }
           }
         }
-      } catch (err) {
+      } catch {
         // ignore
       }
-    },
+    })();
 
-    "tool.execute.before": async (hookInput, output) => {
+    // Tool execution before
+    await ctx.tool.hook("execute.before", async (event) => {
       try {
-        const { tool: toolName, sessionID } = hookInput;
-        const ctx = getOrCreateContext(sessionID, projectDir);
-        const toolInput = output.args ?? {};
+        const toolName = (event as { tool?: string }).tool ?? "unknown";
+        const sessionID = (event as { sessionID?: string }).sessionID ?? "unknown";
+        const pluginCtx = getOrCreateContext(sessionID, projectDir);
+        const toolInput = ((event as { input?: unknown }).input ?? {}) as Record<string, unknown>;
 
-        // Handle subagent (Task tool)
-        if (toolName === "Task") {
+        // Subagent (Task tool)
+        if (toolName === "Task" || toolName === "task") {
           const subagentType = (toolInput as Record<string, unknown>).subagent_type as string ?? "unknown";
           const taskDescription = (toolInput as Record<string, unknown>).description as string ?? "";
-          const subagentResult = await handleSubagentStart(ctx, subagentType, taskDescription);
+          const subagentResult = await handleSubagentStart(pluginCtx, subagentType, taskDescription);
           if (subagentResult.blocked) {
-            output.args = { _blocked: true, _reason: subagentResult.blockReason };
-            return;
+            throw new HookBlockedError(subagentResult.blockReason ?? "Blocked by hook");
           }
         }
 
-        const result = await handlePreToolUse(ctx, toolName, toolInput);
+        const result = await handlePreToolUse(pluginCtx, toolName, toolInput);
         if (result.blocked) {
-          output.args = { _blocked: true, _reason: result.blockReason };
-          return;
+          throw new HookBlockedError(result.blockReason ?? "Blocked by hook");
         }
         if (result.updatedInput) {
-          output.args = { ...toolInput, ...result.updatedInput };
+          (event as { input?: unknown }).input = { ...toolInput, ...result.updatedInput };
         }
       } catch (err) {
-        // ignore
+        if (err instanceof HookBlockedError) throw err;
+        // swallow other errors
       }
-    },
+    });
 
-    "tool.execute.after": async (hookInput, output) => {
+    // Tool execution after
+    await ctx.tool.hook("execute.after", async (event) => {
       try {
-        const { tool: toolName, sessionID } = hookInput;
-        const ctx = sessionContexts.get(sessionID);
-        if (!ctx) return;
+        const toolName = (event as { tool?: string }).tool ?? "unknown";
+        const sessionID = (event as { sessionID?: string }).sessionID ?? "unknown";
+        const pluginCtx = sessionContexts.get(sessionID);
+        if (!pluginCtx) return;
 
-        // Handle subagent (Task tool)
-        if (toolName === "Task") {
-          await handleSubagentStop(ctx, "unknown", "", output.output);
+        if (toolName === "Task" || toolName === "task") {
+          await handleSubagentStop(pluginCtx, "unknown", "", extractToolOutput((event as { result?: unknown }).result ?? (event as { output?: unknown }).output));
         }
 
-        const isError = output.title?.toLowerCase().includes("error") ||
-                        output.output?.toLowerCase().startsWith("error");
+        const status = (event as { status?: string }).status;
+        const isError = status === "error";
+        const toolInput = ((event as { input?: unknown }).input ?? {}) as Record<string, unknown>;
+
         if (isError) {
-          await handlePostToolUseFailure(ctx, toolName, {}, output.output);
+          const err = (event as { error?: unknown }).error;
+          const errText = err instanceof Error ? err.message : String(err ?? "");
+          await handlePostToolUseFailure(pluginCtx, toolName, toolInput, errText);
         } else {
-          await handlePostToolUse(ctx, toolName, {}, output.output);
+          const result = (event as { result?: unknown }).result ?? (event as { output?: unknown }).output;
+          const outputText = extractToolOutput(result);
+          await handlePostToolUse(pluginCtx, toolName, toolInput, outputText);
         }
-      } catch (err) {
+      } catch {
         // ignore
       }
-    },
+    });
 
-    "permission.ask": async (hookInput, output) => {
+    // Permission evaluation
+    await ctx.permission.hook("evaluate", async (event) => {
       try {
-        const sessionID = (hookInput as unknown as { sessionID?: string }).sessionID ?? "unknown";
-        const ctx = getOrCreateContext(sessionID, projectDir);
-        const toolName = (hookInput as unknown as { tool?: string }).tool ?? "unknown";
-        const toolArgs = (hookInput as unknown as { args?: Record<string, unknown> }).args ?? {};
-        const permissionType = (hookInput as unknown as { permission?: string }).permission ?? "unknown";
+        const sessionID = (event as { sessionID?: string }).sessionID ?? "unknown";
+        const pluginCtx = getOrCreateContext(sessionID, projectDir);
+        const action = (event as { action?: string }).action ?? "unknown";
+        const toolArgs = (event as { metadata?: Record<string, unknown> }).metadata ?? {};
+        const args = (toolArgs && typeof toolArgs === "object" && "args" in toolArgs) ? (toolArgs as { args?: Record<string, unknown> }).args ?? {} : {};
+        const permissionType = action;
 
-        const result = await handlePermissionRequest(ctx, toolName, toolArgs, permissionType);
+        const result = await handlePermissionRequest(pluginCtx, action, args, permissionType);
         if (result.permissionDecision === "allow") {
-          output.status = "allow";
+          (event as { effect?: string }).effect = "allow";
         } else if (result.permissionDecision === "deny") {
-          output.status = "deny";
+          (event as { effect?: string }).effect = "deny";
+          if (result.permissionDecisionReason) {
+            (event as { message?: string }).message = result.permissionDecisionReason;
+          }
         }
-      } catch (err) {
+      } catch {
         // ignore
       }
-    },
+    });
 
-    "experimental.session.compacting": async (hookInput, output) => {
+    // Compaction
+    await ctx.session.hook("compaction", async (event) => {
       try {
-        const { sessionID } = hookInput;
-        const ctx = sessionContexts.get(sessionID);
-        if (!ctx) return;
+        const sessionID = (event as { sessionID?: string }).sessionID ?? "unknown";
+        const pluginCtx = sessionContexts.get(sessionID);
+        if (!pluginCtx) return;
 
-        const result = await handlePreCompact(ctx);
+        const result = await handlePreCompact(pluginCtx);
         if (result.additionalContext?.length) {
-          output.context.push(...result.additionalContext);
+          const system = (event as { system?: Array<{ type: string; text: string }> }).system;
+          if (Array.isArray(system)) {
+            for (const c of result.additionalContext) {
+              system.push({ type: "text", text: c });
+            }
+          }
         }
-      } catch (err) {
+      } catch {
         // ignore
       }
-    },
-  };
-};
+    });
 
-export default ClaudeCodeHooksPlugin;
+    return () => controller.abort();
+  },
+});
